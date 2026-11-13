@@ -14,6 +14,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     PollAnswerHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -296,7 +297,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     arg = context.args[0] if context.args else ""
 
-    # 1. Group deep-link: /start grpquiz_<quiz_id> (when someone adds/starts quiz in another group)
+    # 1. Group deep-link: /start grpquiz_<quiz_id>
     if arg.startswith("grpquiz"):
         if chat.type == "private":
             await update.message.reply_text("⚠️ Is link ko kisi Telegram Group me kholein taaki wahan quiz shuru ho sake.")
@@ -451,7 +452,20 @@ async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["waiting_for_file"] = True
     context.user_data["waiting_for_timer"] = False
+    context.user_data["waiting_for_topic"] = False
     await update.message.reply_text("📂 Kripya valid <code>.json</code> quiz file upload karein.", parse_mode="HTML")
+
+def build_topic_keyboard(topics):
+    rows, row = [], []
+    for i, t in enumerate(topics):
+        row.append(InlineKeyboardButton(t[:60], callback_data=f"topic:{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("📚 Sab Topics (All)", callback_data="topic:all")])
+    return InlineKeyboardMarkup(rows)
 
 async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("waiting_for_file") or not is_admin(update):
@@ -479,13 +493,68 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["temp_quiz_data"] = quiz_data
     context.user_data["temp_quiz_name"] = Path(doc.file_name).stem
     context.user_data["waiting_for_file"] = False
-    context.user_data["waiting_for_timer"] = True
 
+    # Unique topics nikaalein (order maintain karte hue)
+    topics = []
+    for item in quiz_data:
+        t = str(item.get("topic", "")).strip()
+        if t and t not in topics:
+            topics.append(t)
+
+    # Topic buttons sirf tab jab 1 se zyada topics hon
+    if len(topics) > 1:
+        context.user_data["temp_topics"] = topics
+        context.user_data["waiting_for_topic"] = True
+        await update.message.reply_text(
+            f"✅ <b>JSON Valid:</b> Total {len(quiz_data)} questions mile, {len(topics)} topics.\n\n"
+            f"📖 Kaun sa topic chahiye? Niche se chunein:",
+            reply_markup=build_topic_keyboard(topics),
+            parse_mode="HTML",
+        )
+        return
+
+    # 1 ya 0 topic: seedha timer poochhein
+    context.user_data["waiting_for_topic"] = False
+    context.user_data["waiting_for_timer"] = True
     await update.message.reply_text(
         f"✅ <b>JSON Valid:</b> Total {len(quiz_data)} questions load hue hain.\n\n"
-        f"⏱️ Har question ke liye timer kitna rakhna hai? (seconds me likhein):\n"
-        f"Udaharan: <code>15</code>, <code>30</code>, <code>45</code>, ya <code>60</code> reply karein.",
-        parse_mode="HTML"
+        f"⏱️ Har question ke liye timer kitna rakhna hai? (seconds me likhein)\n"
+        f"Udaharan: <code>15</code>, <code>30</code>, <code>45</code>, ya <code>60</code>",
+        parse_mode="HTML",
+    )
+
+async def topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update):
+        return
+    if not context.user_data.get("waiting_for_topic"):
+        await query.edit_message_text("⚠️ Ye selection ab valid nahi hai. Naya file upload karein (/newquiz).")
+        return
+
+    choice = query.data.split(":", 1)[1]
+    all_data = context.user_data["temp_quiz_data"]
+    topics = context.user_data["temp_topics"]
+    base_name = context.user_data["temp_quiz_name"]
+
+    if choice == "all":
+        selected = all_data
+        label = base_name
+    else:
+        topic = topics[int(choice)]
+        selected = [q for q in all_data if str(q.get("topic", "")).strip() == topic]
+        label = topic
+
+    context.user_data["temp_quiz_data"] = selected
+    context.user_data["temp_quiz_name"] = label
+    context.user_data["waiting_for_topic"] = False
+    context.user_data["waiting_for_timer"] = True
+
+    await query.edit_message_text(
+        f"✅ Topic: {label}\n"
+        f"Total {len(selected)} questions.\n\n"
+        f"⏱️ Har question ke liye timer (seconds, 10 se 300) bhejein."
     )
 
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -989,6 +1058,7 @@ def main():
     app.add_handler(CommandHandler("savedquizzes", savedquizzes_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CallbackQueryHandler(topic_selected, pattern=r"^topic:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
