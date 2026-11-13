@@ -37,6 +37,7 @@ flask_thread.start()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 DEFAULT_TIMER = int(os.environ.get("QUESTION_TIMER", "30"))
+TIMER_OPTIONS = [15, 30, 45, 60, 90]
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,8 +48,8 @@ pause_event.set()
 active_polls = {}        # poll_id -> (mode, target_id, correct_index)
 quiz_task = None
 quiz_state = None
-user_sessions = {}       # user_id -> {'quiz_id': str, 'quiz_name': str, 'quiz_data': list, 'timer': int, 'index': 0, 'score': 0, 'active': True}
-group_sessions = {}      # chat_id -> {'quiz_id': str, 'quiz_name': str, 'quiz_data': list, 'timer': int, 'index': 0, 'scores': {}, 'names': {}, 'active': True}
+user_sessions = {}       # user_id -> self quiz session
+group_sessions = {}      # chat_id -> shared group quiz session
 group_tasks = {}         # chat_id -> asyncio.Task
 
 
@@ -453,19 +454,26 @@ async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_for_file"] = True
     context.user_data["waiting_for_timer"] = False
     context.user_data["waiting_for_topic"] = False
+    context.user_data["temp_source"] = None
     await update.message.reply_text("📂 Kripya valid <code>.json</code> quiz file upload karein.", parse_mode="HTML")
 
-def build_topic_keyboard(topics):
+def build_topic_keyboard(topics, prefix="topic"):
     rows, row = [], []
     for i, t in enumerate(topics):
-        row.append(InlineKeyboardButton(t[:60], callback_data=f"topic:{i}"))
+        row.append(InlineKeyboardButton(t[:60], callback_data=f"{prefix}:{i}"))
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("📚 Sab Topics (All)", callback_data="topic:all")])
+    if prefix == "topic":
+        rows.append([InlineKeyboardButton("📚 Sab Topics (All)", callback_data="topic:all")])
     return InlineKeyboardMarkup(rows)
+
+def build_timer_keyboard(make_callback):
+    """make_callback(seconds) -> callback_data string"""
+    row = [InlineKeyboardButton(f"⏱️ {s}s", callback_data=make_callback(s)) for s in TIMER_OPTIONS]
+    return InlineKeyboardMarkup([row[:3], row[3:]])
 
 async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("waiting_for_file") or not is_admin(update):
@@ -492,6 +500,7 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["temp_quiz_data"] = quiz_data
     context.user_data["temp_quiz_name"] = Path(doc.file_name).stem
+    context.user_data["temp_source"] = None
     context.user_data["waiting_for_file"] = False
 
     # Unique topics nikaalein (order maintain karte hue)
@@ -505,6 +514,7 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(topics) > 1:
         context.user_data["temp_topics"] = topics
         context.user_data["waiting_for_topic"] = True
+        context.user_data["waiting_for_timer"] = False
         await update.message.reply_text(
             f"✅ <b>JSON Valid:</b> Total {len(quiz_data)} questions mile, {len(topics)} topics.\n\n"
             f"📖 Kaun sa topic chahiye? Niche se chunein:",
@@ -513,13 +523,13 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 1 ya 0 topic: seedha timer poochhein
+    # 1 ya 0 topic: seedha timer buttons
     context.user_data["waiting_for_topic"] = False
     context.user_data["waiting_for_timer"] = True
     await update.message.reply_text(
         f"✅ <b>JSON Valid:</b> Total {len(quiz_data)} questions load hue hain.\n\n"
-        f"⏱️ Har question ke liye timer kitna rakhna hai? (seconds me likhein)\n"
-        f"Udaharan: <code>15</code>, <code>30</code>, <code>45</code>, ya <code>60</code>",
+        f"⏱️ Har question ka timer chunein (ya seconds me likh kar bhejein):",
+        reply_markup=build_timer_keyboard(lambda s: f"timer:{s}"),
         parse_mode="HTML",
     )
 
@@ -546,6 +556,8 @@ async def topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected = [q for q in all_data if str(q.get("topic", "")).strip() == topic]
         label = topic
 
+    # Poori file aur topic list save karein taaki quiz ke baad agla topic chun sakein
+    context.user_data["temp_source"] = {"data": all_data, "topics": topics, "name": base_name}
     context.user_data["temp_quiz_data"] = selected
     context.user_data["temp_quiz_name"] = label
     context.user_data["waiting_for_topic"] = False
@@ -554,30 +566,19 @@ async def topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"✅ Topic: {label}\n"
         f"Total {len(selected)} questions.\n\n"
-        f"⏱️ Har question ke liye timer (seconds, 10 se 300) bhejein."
+        f"⏱️ Ab timer chunein (ya seconds me likh kar bhejein):",
+        reply_markup=build_timer_keyboard(lambda s: f"timer:{s}"),
     )
 
-async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def launch_quiz(bot, quiz_data, quiz_name, timer_val, source=None, chat_id=None):
+    """Naya quiz shuru karta hai. Purana quiz library me save hota hai. Returns (new_id, archived_id)."""
     global quiz_state, quiz_task
 
-    if not context.user_data.get("waiting_for_timer") or not is_admin(update):
-        return
-
-    text = update.message.text.strip()
-    if not text.isdigit() or int(text) < 10 or int(text) > 300:
-        await update.message.reply_text("⚠️ Kripya 10 se 300 seconds ke beech ka koi number bhejein (jaise: 30).")
-        return
-
-    timer_val = int(text)
-    context.user_data["waiting_for_timer"] = False
-
-    raw_chat_id = os.environ.get("TARGET_CHAT_ID")
-    if not raw_chat_id:
-        await update.message.reply_text("❌ Render Environment me TARGET_CHAT_ID set nahi hai.")
-        return
-
-    quiz_data = context.user_data.get("temp_quiz_data")
-    quiz_name = context.user_data.get("temp_quiz_name")
+    if chat_id is None:
+        raw_chat_id = os.environ.get("TARGET_CHAT_ID")
+        if not raw_chat_id:
+            raise ValueError("Render Environment me TARGET_CHAT_ID set nahi hai.")
+        chat_id = int(raw_chat_id)
 
     archived_id = None
     if quiz_state and quiz_state.get("quiz_data"):
@@ -593,7 +594,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     quiz_state = {
         "quiz_id": new_quiz_id,
         "quiz_name": quiz_name,
-        "chat_id": int(raw_chat_id),
+        "chat_id": chat_id,
         "quiz_data": quiz_data,
         "current_index": 0,
         "timer": timer_val,
@@ -602,10 +603,73 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         "status": "running",
         "total": len(quiz_data),
     }
+    if source:
+        quiz_state["source_data"] = source["data"]
+        quiz_state["source_topics"] = source["topics"]
+        quiz_state["source_name"] = source["name"]
+
     save_state()
     save_quiz_to_library(quiz_state)
     active_polls.clear()
     pause_event.set()
+    quiz_task = asyncio.create_task(run_quiz(bot))
+    return new_quiz_id, archived_id
+
+async def timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Timer button click: quiz turant shuru."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update):
+        return
+    if not context.user_data.get("waiting_for_timer"):
+        await query.edit_message_text("⚠️ Ye selection ab valid nahi hai. Naya file upload karein (/newquiz).")
+        return
+
+    timer_val = int(query.data.split(":", 1)[1])
+    context.user_data["waiting_for_timer"] = False
+
+    quiz_data = context.user_data.get("temp_quiz_data")
+    quiz_name = context.user_data.get("temp_quiz_name")
+    source = context.user_data.get("temp_source")
+    context.user_data["temp_source"] = None
+
+    try:
+        _, archived_id = await launch_quiz(context.bot, quiz_data, quiz_name, timer_val, source=source)
+    except ValueError as exc:
+        await query.edit_message_text(f"❌ {exc}")
+        return
+
+    await query.edit_message_text(
+        f"🚀 <b>Quiz Ready! Shuru ho raha hai...</b>\n\n"
+        f"📌 <b>Topic:</b> {esc(quiz_name)}\n"
+        f"📊 <b>Questions:</b> {len(quiz_data)}\n"
+        f"⏱️ <b>Timer:</b> {timer_val}s per question",
+        parse_mode="HTML",
+    )
+
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("waiting_for_timer") or not is_admin(update):
+        return
+
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) < 10 or int(text) > 300:
+        await update.message.reply_text("⚠️ Kripya 10 se 300 seconds ke beech ka koi number bhejein (jaise: 30), ya upar ka button dabayein.")
+        return
+
+    timer_val = int(text)
+    context.user_data["waiting_for_timer"] = False
+
+    quiz_data = context.user_data.get("temp_quiz_data")
+    quiz_name = context.user_data.get("temp_quiz_name")
+    source = context.user_data.get("temp_source")
+    context.user_data["temp_source"] = None
+
+    try:
+        _, archived_id = await launch_quiz(context.bot, quiz_data, quiz_name, timer_val, source=source)
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
 
     saved_note = f"\n🗂️ Purana quiz library me save ho gaya (ID: <code>{esc(archived_id)}</code>)." if archived_id else ""
     await update.message.reply_text(
@@ -615,7 +679,80 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         f"⏱️ <b>Timer:</b> {timer_val}s per question{saved_note}",
         parse_mode="HTML"
     )
-    quiz_task = asyncio.create_task(run_quiz(context.bot))
+
+async def next_topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quiz complete ke baad agla topic chunne par: pehle timer buttons."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update):
+        return
+    if not quiz_state or quiz_state.get("status") != "completed" or not quiz_state.get("source_topics"):
+        await query.edit_message_text("⚠️ Ye selection ab valid nahi hai. Naya file upload karein (/newquiz).")
+        return
+
+    topics = quiz_state["source_topics"]
+    src = quiz_state["source_data"]
+    try:
+        idx = int(query.data.split(":", 1)[1])
+        topic = topics[idx]
+    except (ValueError, IndexError):
+        await query.edit_message_text("⚠️ Topic samajh nahi aaya. Dobara chunein.")
+        return
+
+    selected = [q for q in src if str(q.get("topic", "")).strip() == topic]
+    if not selected:
+        await query.edit_message_text("⚠️ Is topic me koi question nahi mila.")
+        return
+
+    await query.edit_message_text(
+        f"📖 Topic: <b>{esc(topic)}</b>\n"
+        f"📊 Total {len(selected)} questions.\n\n"
+        f"⏱️ Ab timer chunein:",
+        reply_markup=build_timer_keyboard(lambda s: f"nexttimer:{idx}:{s}"),
+        parse_mode="HTML",
+    )
+
+async def next_timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Agle topic ke liye timer click: quiz turant shuru."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update):
+        return
+    if not quiz_state or quiz_state.get("status") != "completed" or not quiz_state.get("source_topics"):
+        await query.edit_message_text("⚠️ Ye selection ab valid nahi hai. Naya file upload karein (/newquiz).")
+        return
+
+    try:
+        _, idx_s, sec_s = query.data.split(":")
+        idx, timer_val = int(idx_s), int(sec_s)
+        topics = quiz_state["source_topics"]
+        topic = topics[idx]
+    except (ValueError, IndexError):
+        await query.edit_message_text("⚠️ Selection samajh nahi aayi. Dobara chunein.")
+        return
+
+    src = quiz_state["source_data"]
+    selected = [q for q in src if str(q.get("topic", "")).strip() == topic]
+    if not selected:
+        await query.edit_message_text("⚠️ Is topic me koi question nahi mila.")
+        return
+
+    # Source aur chat ko launch se pehle save karein (launch quiz_state badal dega)
+    source = {
+        "data": src,
+        "topics": topics,
+        "name": quiz_state.get("source_name", ""),
+    }
+    chat_id = quiz_state["chat_id"]
+
+    await query.edit_message_text(
+        f"🚀 Agla topic shuru ho raha hai: <b>{esc(topic)}</b>\n"
+        f"📊 {len(selected)} questions, ⏱️ {timer_val}s per question.",
+        parse_mode="HTML",
+    )
+    await launch_quiz(context.bot, selected, topic, timer_val, source=source, chat_id=chat_id)
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state, quiz_task
@@ -890,6 +1027,21 @@ async def run_quiz(bot):
         saved_id = save_quiz_to_library(quiz_state)
         await send_leaderboard(bot, chat_id, total_q, custom_quiz_id=saved_id)
 
+        # Agla topic chunne ka menu admin ko private me bhejein
+        if quiz_state.get("source_topics") and ADMIN_ID:
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"✅ <b>{esc(quiz_state.get('quiz_name', 'Quiz'))}</b> complete ho gaya.\n\n"
+                        f"📚 Agla topic chunein (phir timer chunenge):"
+                    ),
+                    reply_markup=build_topic_keyboard(quiz_state["source_topics"], prefix="nexttopic"),
+                    parse_mode="HTML",
+                )
+            except Exception as exc:
+                print(f"Next-topic menu error: {exc}")
+
 
 # ---------------- Poll Answer Handler (Group, Shared Group & Individual) ----------------
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1059,6 +1211,9 @@ def main():
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CallbackQueryHandler(topic_selected, pattern=r"^topic:"))
+    app.add_handler(CallbackQueryHandler(timer_selected, pattern=r"^timer:"))
+    app.add_handler(CallbackQueryHandler(next_topic_selected, pattern=r"^nexttopic:"))
+    app.add_handler(CallbackQueryHandler(next_timer_selected, pattern=r"^nexttimer:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
