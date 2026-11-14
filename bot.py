@@ -4,10 +4,10 @@ import json
 import time
 import urllib.parse
 import asyncio
-import sqlite3
 import threading
 from pathlib import Path
 from flask import Flask
+from pymongo import MongoClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -24,7 +24,7 @@ web_app = Flask(__name__)
 
 @web_app.route("/")
 def home():
-    return "Telegram Quiz Bot is running successfully!"
+    return "Telegram Quiz Bot with MongoDB is running successfully!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -33,15 +33,17 @@ def run_web():
 flask_thread = threading.Thread(target=run_web, daemon=True)
 flask_thread.start()
 
-# ---------------- Configuration & Persistence Setup ----------------
+# ---------------- Configuration & MongoDB Setup ----------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 DEFAULT_TIMER = int(os.environ.get("QUESTION_TIMER", "30"))
 TIMER_OPTIONS = [15, 30, 45, 60, 90]
+MONGO_URI = os.environ.get("MONGO_URI")
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "quiz_progress.sqlite3"
+mongo_client = None
+db = None
+state_col = None
+quizzes_col = None
 
 pause_event = asyncio.Event()
 pause_event.set()
@@ -58,77 +60,131 @@ def esc(val) -> str:
     return html.escape(str(val)) if val is not None else ""
 
 
-# ---------------- SQLite Persistence ----------------
+def parse_question_item(item, index, total_q):
+    """Safely extracts question text, options list (handles a/b/c/d & A/B/C/D), correct index, and explanation."""
+    q_num = item.get("number", item.get("id", index + 1))
+    q_text = f"[{index + 1}/{total_q}] Q{q_num}. {item.get('question', '')}"
+
+    raw_options = item.get("options", {})
+    if isinstance(raw_options, dict):
+        norm_opts = {str(k).strip().upper(): v for k, v in raw_options.items()}
+        options = [norm_opts[k] for k in ("A", "B", "C", "D") if k in norm_opts]
+    elif isinstance(raw_options, list):
+        options = raw_options[:4]
+    else:
+        options = []
+
+    mapping = {"A": 0, "B": 1, "C": 2, "D": 3, "0": 0, "1": 1, "2": 2, "3": 3}
+    correct_raw = str(item.get("answer", "A")).strip().upper()
+    correct_index = mapping.get(correct_raw, 0)
+    if correct_index >= len(options):
+        correct_index = 0
+
+    raw_exp = str(item.get("explanation", "")).strip()
+    explanation = raw_exp[:200] if raw_exp else None
+
+    return q_text, options, correct_index, explanation
+
+
+# ---------------- MongoDB Persistence Functions ----------------
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS quiz_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                payload TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS saved_quizzes (
-                quiz_id TEXT PRIMARY KEY,
-                quiz_name TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                saved_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+    global mongo_client, db, state_col, quizzes_col
+    if not MONGO_URI:
+        print("⚠️ WARNING: MONGO_URI set nahi hai! Data permanent save nahi hoga.")
+        return
+    try:
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        mongo_client.admin.command("ping")
+        db = mongo_client["telegram_quiz_bot"]
+        state_col = db["active_state"]
+        quizzes_col = db["saved_quizzes"]
+        print("✅ MongoDB successfully connected!")
+    except Exception as exc:
+        print(f"❌ MongoDB Connection Error: {exc}")
 
 def save_state():
-    if quiz_state is None:
+    if quiz_state is None or state_col is None:
         return
-    payload = json.dumps(quiz_state, ensure_ascii=False)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT INTO quiz_state (id, payload) VALUES (1, ?) "
-            "ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
-            (payload,),
-        )
+    try:
+        doc = dict(quiz_state)
+        doc["_id"] = "current_state"
+        state_col.replace_one({"_id": "current_state"}, doc, upsert=True)
+    except Exception as exc:
+        print(f"MongoDB save_state error: {exc}")
 
 def load_state():
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT payload FROM quiz_state WHERE id = 1").fetchone()
-    return json.loads(row[0]) if row else None
+    if state_col is None:
+        return None
+    try:
+        doc = state_col.find_one({"_id": "current_state"})
+        if doc:
+            doc.pop("_id", None)
+            return doc
+    except Exception as exc:
+        print(f"MongoDB load_state error: {exc}")
+    return None
 
 def save_quiz_to_library(state_dict=None):
-    """Stores a quiz permanently in saved_quizzes so anyone can replay/share it anytime."""
+    """Stores a quiz permanently in MongoDB saved_quizzes collection."""
     target = state_dict or quiz_state
     if not target or not target.get("quiz_data"):
         return None
     quiz_id = str(target.get("quiz_id") or int(time.time()))
     target["quiz_id"] = quiz_id
     name = target.get("quiz_name") or f"Quiz-{quiz_id}"
-    payload = json.dumps(target, ensure_ascii=False)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO saved_quizzes (quiz_id, quiz_name, payload) VALUES (?, ?, ?)",
-            (quiz_id, name, payload),
-        )
+
+    if quizzes_col is None:
+        return quiz_id
+
+    try:
+        doc = {
+            "_id": quiz_id,
+            "quiz_id": quiz_id,
+            "quiz_name": name,
+            "saved_at": time.time(),
+            "payload": target,
+        }
+        quizzes_col.replace_one({"_id": quiz_id}, doc, upsert=True)
+    except Exception as exc:
+        print(f"MongoDB save_quiz_to_library error: {exc}")
     return quiz_id
 
 def list_saved_quizzes():
-    with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            "SELECT quiz_id, quiz_name, json_extract(payload, '$.current_index'), json_extract(payload, '$.total') "
-            "FROM saved_quizzes ORDER BY saved_at DESC"
-        ).fetchall()
+    if quizzes_col is None:
+        return []
+    try:
+        cursor = quizzes_col.find({}, {"quiz_id": 1, "quiz_name": 1, "payload.current_index": 1, "payload.total": 1}).sort("saved_at", -1)
+        results = []
+        for doc in cursor:
+            payload = doc.get("payload", {})
+            results.append((
+                doc.get("quiz_id"),
+                doc.get("quiz_name", "Untitled"),
+                payload.get("current_index", 0),
+                payload.get("total", 0),
+            ))
+        return results
+    except Exception as exc:
+        print(f"MongoDB list_saved_quizzes error: {exc}")
+        return []
 
 def get_quiz_by_id(quiz_id=None):
-    """Fetch a specific quiz from active state or saved library."""
+    """Fetch a specific quiz from active state or MongoDB library."""
     if quiz_state and quiz_state.get("quiz_data"):
         if not quiz_id or str(quiz_state.get("quiz_id")) == str(quiz_id):
             return str(quiz_state.get("quiz_id", "current")), quiz_state
 
-    with sqlite3.connect(DB_PATH) as conn:
-        if quiz_id:
-            row = conn.execute("SELECT quiz_id, payload FROM saved_quizzes WHERE quiz_id=?", (str(quiz_id),)).fetchone()
-        else:
-            row = conn.execute("SELECT quiz_id, payload FROM saved_quizzes ORDER BY saved_at DESC LIMIT 1").fetchone()
+    if quizzes_col is not None:
+        try:
+            if quiz_id:
+                doc = quizzes_col.find_one({"_id": str(quiz_id)})
+            else:
+                doc = quizzes_col.find_one(sort=[("saved_at", -1)])
+            if doc and doc.get("payload"):
+                return doc["quiz_id"], doc["payload"]
+        except Exception as exc:
+            print(f"MongoDB get_quiz_by_id error: {exc}")
 
-    if row:
-        return row[0], json.loads(row[1])
     if quiz_state and quiz_state.get("quiz_data"):
         return str(quiz_state.get("quiz_id", "current")), quiz_state
     return None, None
@@ -184,33 +240,28 @@ async def send_self_quiz_question(bot, user_id):
         return
 
     item = quiz_data[idx]
-    q_num = item.get("number", idx + 1)
-    q_text = f"[{idx + 1}/{total_q}] Q{q_num}. {item.get('question', '')}"
-    options_dict = item.get("options", {})
-    options = [options_dict[k] for k in ("A", "B", "C", "D") if k in options_dict]
+    q_text, options, correct_index, explanation = parse_question_item(item, idx, total_q)
 
     if len(options) < 2:
         session["index"] = idx + 1
         await send_self_quiz_question(bot, user_id)
         return
 
-    mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
-    correct_letter = str(item.get("answer", "A")).strip().upper()
-    correct_index = mapping.get(correct_letter, 0)
-    if correct_index >= len(options):
-        correct_index = 0
-
     timer = session.get("timer", DEFAULT_TIMER)
     try:
-        poll_msg = await bot.send_poll(
-            chat_id=user_id,
-            question=q_text[:300],
-            options=[str(opt)[:100] for opt in options],
-            type="quiz",
-            correct_option_id=correct_index,
-            is_anonymous=False,
-            open_period=timer,
-        )
+        poll_kwargs = {
+            "chat_id": user_id,
+            "question": q_text[:300],
+            "options": [str(opt)[:100] for opt in options],
+            "type": "quiz",
+            "correct_option_id": correct_index,
+            "is_anonymous": False,
+            "open_period": timer,
+        }
+        if explanation:
+            poll_kwargs["explanation"] = explanation
+
+        poll_msg = await bot.send_poll(**poll_kwargs)
         active_polls[poll_msg.poll.id] = ("self", user_id, correct_index)
     except Exception as exc:
         print(f"Self-poll error: {exc}")
@@ -227,7 +278,6 @@ async def run_shared_group_quiz(bot, target_chat_id):
     timer = session.get("timer", DEFAULT_TIMER)
     quiz_name = session.get("quiz_name", "Mock Test")
     quiz_id = session.get("quiz_id", "")
-    mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
 
     try:
         await bot.send_message(
@@ -252,29 +302,25 @@ async def run_shared_group_quiz(bot, target_chat_id):
         if not session.get("active"):
             return
 
-        q_num = item.get("number", index + 1)
-        q_text = f"[{index + 1}/{total_q}] Q{q_num}. {item.get('question', '')}"
-        options_dict = item.get("options", {})
-        options = [options_dict[k] for k in ("A", "B", "C", "D") if k in options_dict]
+        q_text, options, correct_index, explanation = parse_question_item(item, index, total_q)
 
         if len(options) < 2:
             continue
 
-        correct_letter = str(item.get("answer", "A")).strip().upper()
-        correct_index = mapping.get(correct_letter, 0)
-        if correct_index >= len(options):
-            correct_index = 0
-
         try:
-            poll_msg = await bot.send_poll(
-                chat_id=target_chat_id,
-                question=q_text[:300],
-                options=[str(opt)[:100] for opt in options],
-                type="quiz",
-                correct_option_id=correct_index,
-                is_anonymous=False,
-                open_period=timer,
-            )
+            poll_kwargs = {
+                "chat_id": target_chat_id,
+                "question": q_text[:300],
+                "options": [str(opt)[:100] for opt in options],
+                "type": "quiz",
+                "correct_option_id": correct_index,
+                "is_anonymous": False,
+                "open_period": timer,
+            }
+            if explanation:
+                poll_kwargs["explanation"] = explanation
+
+            poll_msg = await bot.send_poll(**poll_kwargs)
             active_polls[poll_msg.poll.id] = ("shared_group", target_chat_id, correct_index)
             await asyncio.sleep(timer + 2)
         except Exception as exc:
@@ -298,7 +344,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     arg = context.args[0] if context.args else ""
 
-    # 1. Group deep-link: /start grpquiz_<quiz_id>
     if arg.startswith("grpquiz"):
         if chat.type == "private":
             await update.message.reply_text("⚠️ Is link ko kisi Telegram Group me kholein taaki wahan quiz shuru ho sake.")
@@ -328,7 +373,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group_tasks[chat.id] = asyncio.create_task(run_shared_group_quiz(context.bot, chat.id))
         return
 
-    # 2. Private Self-Quiz deep-link: /start selfquiz or /start selfquiz_<quiz_id>
     if arg.startswith("selfquiz"):
         parts = arg.split("_", 1)
         req_id = parts[1] if len(parts) > 1 and parts[1] else None
@@ -401,7 +445,6 @@ async def selfquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_self_quiz_question(context.bot, user_id)
 
 async def quizzes_library_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Public command so any student/user can pick, self-test, or share any past quiz."""
     rows = list_saved_quizzes()
     bot_info = await context.bot.get_me()
     bot_username = bot_info.username
@@ -471,7 +514,6 @@ def build_topic_keyboard(topics, prefix="topic"):
     return InlineKeyboardMarkup(rows)
 
 def build_timer_keyboard(make_callback):
-    """make_callback(seconds) -> callback_data string"""
     row = [InlineKeyboardButton(f"⏱️ {s}s", callback_data=make_callback(s)) for s in TIMER_OPTIONS]
     return InlineKeyboardMarkup([row[:3], row[3:]])
 
@@ -503,14 +545,12 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["temp_source"] = None
     context.user_data["waiting_for_file"] = False
 
-    # Unique topics nikaalein (order maintain karte hue)
     topics = []
     for item in quiz_data:
         t = str(item.get("topic", "")).strip()
         if t and t not in topics:
             topics.append(t)
 
-    # Topic buttons sirf tab jab 1 se zyada topics hon
     if len(topics) > 1:
         context.user_data["temp_topics"] = topics
         context.user_data["waiting_for_topic"] = True
@@ -523,7 +563,6 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 1 ya 0 topic: seedha timer buttons
     context.user_data["waiting_for_topic"] = False
     context.user_data["waiting_for_timer"] = True
     await update.message.reply_text(
@@ -556,7 +595,6 @@ async def topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected = [q for q in all_data if str(q.get("topic", "")).strip() == topic]
         label = topic
 
-    # Poori file aur topic list save karein taaki quiz ke baad agla topic chun sakein
     context.user_data["temp_source"] = {"data": all_data, "topics": topics, "name": base_name}
     context.user_data["temp_quiz_data"] = selected
     context.user_data["temp_quiz_name"] = label
@@ -571,7 +609,7 @@ async def topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def launch_quiz(bot, quiz_data, quiz_name, timer_val, source=None, chat_id=None):
-    """Naya quiz shuru karta hai. Purana quiz library me save hota hai. Returns (new_id, archived_id)."""
+    """Naya quiz shuru karta hai. Purana quiz MongoDB library me save hota hai."""
     global quiz_state, quiz_task
 
     if chat_id is None:
@@ -616,7 +654,6 @@ async def launch_quiz(bot, quiz_data, quiz_name, timer_val, source=None, chat_id
     return new_quiz_id, archived_id
 
 async def timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Timer button click: quiz turant shuru."""
     query = update.callback_query
     await query.answer()
 
@@ -671,7 +708,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ {exc}")
         return
 
-    saved_note = f"\n🗂️ Purana quiz library me save ho gaya (ID: <code>{esc(archived_id)}</code>)." if archived_id else ""
+    saved_note = f"\n🗂️ Purana quiz MongoDB library me save ho gaya (ID: <code>{esc(archived_id)}</code>)." if archived_id else ""
     await update.message.reply_text(
         f"🚀 <b>Quiz Ready! Shuru ho raha hai...</b>\n\n"
         f"📌 <b>Topic:</b> {esc(quiz_name)}\n"
@@ -681,7 +718,6 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def next_topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quiz complete ke baad agla topic chunne par: pehle timer buttons."""
     query = update.callback_query
     await query.answer()
 
@@ -714,7 +750,6 @@ async def next_topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def next_timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Agle topic ke liye timer click: quiz turant shuru."""
     query = update.callback_query
     await query.answer()
 
@@ -739,7 +774,6 @@ async def next_timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("⚠️ Is topic me koi question nahi mila.")
         return
 
-    # Source aur chat ko launch se pehle save karein (launch quiz_state badal dega)
     source = {
         "data": src,
         "topics": topics,
@@ -908,7 +942,7 @@ async def savedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not rows:
         await update.message.reply_text("Koi saved quiz nahi hai.")
         return
-    lines = ["🗂️ <b>Saved Quizzes Library:</b>"]
+    lines = ["🗂️ <b>Saved Quizzes Library (MongoDB):</b>"]
     for q_id, name, done, total in rows:
         lines.append(f"• <code>{esc(q_id)}</code> | <b>{esc(name)}</b> | {total or 0} Qs")
     lines.append("\nMain group me chalane ke liye: <code>/resume ID</code>")
@@ -943,7 +977,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state()
     save_quiz_to_library(quiz_state)
     pause_event.set()
-    await update.message.reply_text("⏹️ Quiz band kar diya gaya hai aur library me save kar diya gaya hai.")
+    await update.message.reply_text("⏹️ Quiz band kar diya gaya hai aur MongoDB library me save kar diya gaya hai.")
 
 
 # ---------------- Group Quiz Runner ----------------
@@ -956,7 +990,6 @@ async def run_quiz(bot):
     quiz_data = quiz_state["quiz_data"]
     total_q = len(quiz_data)
     timer = quiz_state.get("timer", DEFAULT_TIMER)
-    mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
 
     if quiz_state.get("current_index", 0) == 0:
         try:
@@ -987,31 +1020,27 @@ async def run_quiz(bot):
 
         index = quiz_state["current_index"]
         item = quiz_data[index]
-        q_num = item.get("number", index + 1)
-        q_text = f"[{index + 1}/{total_q}] Q{q_num}. {item.get('question', '')}"
-        options_dict = item.get("options", {})
-        options = [options_dict[k] for k in ("A", "B", "C", "D") if k in options_dict]
+        q_text, options, correct_index, explanation = parse_question_item(item, index, total_q)
 
         if len(options) < 2:
             quiz_state["current_index"] = index + 1
             save_state()
             continue
 
-        correct_letter = str(item.get("answer", "A")).strip().upper()
-        correct_index = mapping.get(correct_letter, 0)
-        if correct_index >= len(options):
-            correct_index = 0
-
         try:
-            poll_msg = await bot.send_poll(
-                chat_id=chat_id,
-                question=q_text[:300],
-                options=[str(opt)[:100] for opt in options],
-                type="quiz",
-                correct_option_id=correct_index,
-                is_anonymous=False,
-                open_period=timer,
-            )
+            poll_kwargs = {
+                "chat_id": chat_id,
+                "question": q_text[:300],
+                "options": [str(opt)[:100] for opt in options],
+                "type": "quiz",
+                "correct_option_id": correct_index,
+                "is_anonymous": False,
+                "open_period": timer,
+            }
+            if explanation:
+                poll_kwargs["explanation"] = explanation
+
+            poll_msg = await bot.send_poll(**poll_kwargs)
             active_polls[poll_msg.poll.id] = ("group", chat_id, correct_index)
             await asyncio.sleep(timer + 2)
         except Exception as exc:
@@ -1027,7 +1056,6 @@ async def run_quiz(bot):
         saved_id = save_quiz_to_library(quiz_state)
         await send_leaderboard(bot, chat_id, total_q, custom_quiz_id=saved_id)
 
-        # Agla topic chunne ka menu admin ko private me bhejein
         if quiz_state.get("source_topics") and ADMIN_ID:
             try:
                 await bot.send_message(
@@ -1043,7 +1071,7 @@ async def run_quiz(bot):
                 print(f"Next-topic menu error: {exc}")
 
 
-# ---------------- Poll Answer Handler (Group, Shared Group & Individual) ----------------
+# ---------------- Poll Answer Handler ----------------
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.poll_answer
     user = answer.user
@@ -1084,7 +1112,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await send_self_quiz_question(context.bot, user_id)
 
 
-# ---------------- Stylish Leaderboard with Self & Group Share Buttons ----------------
+# ---------------- Stylish Leaderboard ----------------
 async def send_leaderboard(
     bot,
     chat_id,
@@ -1168,7 +1196,7 @@ async def restore_quiz(application):
     if quiz_state and quiz_state.get("status") == "running":
         pause_event.set()
         quiz_task = asyncio.create_task(run_quiz(application.bot))
-        print(">> Running quiz SQLite se restore ho gaya.")
+        print(">> Running quiz MongoDB se restore ho gaya.")
     elif quiz_state and quiz_state.get("status") == "paused":
         pause_event.clear()
         print(">> Quiz paused hai. /resume se continue karein.")
@@ -1224,3 +1252,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
