@@ -1,2 +1,5 @@
 python-telegram-bot>=20,<23
 flask>=2.3,<4
+flask
+python-telegram-bot
+pymongo[srv]
