@@ -47,7 +47,7 @@ quizzes_col = None
 
 pause_event = asyncio.Event()
 pause_event.set()
-active_polls = {}        # poll_id -> (mode, target_id, correct_index)
+active_polls = {}        # poll_id -> (mode, target_id, correct_index, quiz_id)
 quiz_task = None
 quiz_state = None
 user_sessions = {}       # user_id -> self quiz session
@@ -103,14 +103,17 @@ def init_db():
         print(f"❌ MongoDB Connection Error: {exc}")
 
 def save_state():
-    if quiz_state is None or state_col is None:
+    if quiz_state is None:
         return
-    try:
-        doc = dict(quiz_state)
-        doc["_id"] = "current_state"
-        state_col.replace_one({"_id": "current_state"}, doc, upsert=True)
-    except Exception as exc:
-        print(f"MongoDB save_state error: {exc}")
+    if state_col is not None:
+        try:
+            doc = dict(quiz_state)
+            doc["_id"] = "current_state"
+            state_col.replace_one({"_id": "current_state"}, doc, upsert=True)
+        except Exception as exc:
+            print(f"MongoDB save_state error: {exc}")
+    # Keep library synced with latest progress
+    save_quiz_to_library(quiz_state)
 
 def load_state():
     if state_col is None:
@@ -137,12 +140,14 @@ def save_quiz_to_library(state_dict=None):
         return quiz_id
 
     try:
+        payload_copy = dict(target)
+        payload_copy.pop("_id", None)
         doc = {
             "_id": quiz_id,
             "quiz_id": quiz_id,
             "quiz_name": name,
             "saved_at": time.time(),
-            "payload": target,
+            "payload": payload_copy,
         }
         quizzes_col.replace_one({"_id": quiz_id}, doc, upsert=True)
     except Exception as exc:
@@ -153,7 +158,10 @@ def list_saved_quizzes():
     if quizzes_col is None:
         return []
     try:
-        cursor = quizzes_col.find({}, {"quiz_id": 1, "quiz_name": 1, "payload.current_index": 1, "payload.total": 1}).sort("saved_at", -1)
+        cursor = quizzes_col.find(
+            {},
+            {"quiz_id": 1, "quiz_name": 1, "payload.current_index": 1, "payload.total": 1, "payload.status": 1}
+        ).sort("saved_at", -1)
         results = []
         for doc in cursor:
             payload = doc.get("payload", {})
@@ -162,6 +170,7 @@ def list_saved_quizzes():
                 doc.get("quiz_name", "Untitled"),
                 payload.get("current_index", 0),
                 payload.get("total", 0),
+                payload.get("status", "saved"),
             ))
         return results
     except Exception as exc:
@@ -172,7 +181,7 @@ def get_quiz_by_id(quiz_id=None):
     """Fetch a specific quiz from active state or MongoDB library."""
     if quiz_state and quiz_state.get("quiz_data"):
         if not quiz_id or str(quiz_state.get("quiz_id")) == str(quiz_id):
-            return str(quiz_state.get("quiz_id", "current")), quiz_state
+            return str(quiz_state.get("quiz_id", "current")), dict(quiz_state)
 
     if quizzes_col is not None:
         try:
@@ -181,12 +190,12 @@ def get_quiz_by_id(quiz_id=None):
             else:
                 doc = quizzes_col.find_one(sort=[("saved_at", -1)])
             if doc and doc.get("payload"):
-                return doc["quiz_id"], doc["payload"]
+                return doc["quiz_id"], dict(doc["payload"])
         except Exception as exc:
             print(f"MongoDB get_quiz_by_id error: {exc}")
 
     if quiz_state and quiz_state.get("quiz_data"):
-        return str(quiz_state.get("quiz_id", "current")), quiz_state
+        return str(quiz_state.get("quiz_id", "current")), dict(quiz_state)
     return None, None
 
 def is_admin(update: Update) -> bool:
@@ -262,7 +271,7 @@ async def send_self_quiz_question(bot, user_id):
             poll_kwargs["explanation"] = explanation
 
         poll_msg = await bot.send_poll(**poll_kwargs)
-        active_polls[poll_msg.poll.id] = ("self", user_id, correct_index)
+        active_polls[poll_msg.poll.id] = ("self", user_id, correct_index, quiz_id)
     except Exception as exc:
         print(f"Self-poll error: {exc}")
 
@@ -321,7 +330,7 @@ async def run_shared_group_quiz(bot, target_chat_id):
                 poll_kwargs["explanation"] = explanation
 
             poll_msg = await bot.send_poll(**poll_kwargs)
-            active_polls[poll_msg.poll.id] = ("shared_group", target_chat_id, correct_index)
+            active_polls[poll_msg.poll.id] = ("shared_group", target_chat_id, correct_index, quiz_id)
             await asyncio.sleep(timer + 2)
         except Exception as exc:
             print(f"Shared group poll error: {exc}")
@@ -410,6 +419,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔹 <code>/share</code> - Current quiz dosto ya groups me share karein\n"
         "🔹 <code>/status</code> - Current quiz progress check karein\n"
         "🔹 <code>/newquiz</code> - Nayi JSON quiz file upload karein (admin)\n"
+        "🔹 <code>/savedquizzes</code> - Purane/Paused quizzes ko 1-click me resume karein (admin)\n"
         "🔹 <code>/restart</code> - Current quiz shuru se restart karein (admin)\n"
         "🔹 <code>/pause</code> | <code>/resume</code> | <code>/stop</code> - Quiz control (admin)",
         parse_mode="HTML"
@@ -458,7 +468,7 @@ async def quizzes_library_command(update: Update, context: ContextTypes.DEFAULT_
             seen_ids.add(cur_id)
             items.append((cur_id, quiz_state.get("quiz_name", "Current Quiz"), len(quiz_state["quiz_data"])))
 
-    for q_id, name, done, total in rows:
+    for q_id, name, done, total, _ in rows:
         if str(q_id) not in seen_ids:
             seen_ids.add(str(q_id))
             items.append((str(q_id), name, total or 0))
@@ -494,6 +504,10 @@ async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Pehle /pause karein, phir nayi JSON upload karein.")
         return
 
+    # Save current paused quiz safely before uploading a new one
+    if quiz_state and quiz_state.get("quiz_data"):
+        save_quiz_to_library(quiz_state)
+
     context.user_data["waiting_for_file"] = True
     context.user_data["waiting_for_timer"] = False
     context.user_data["waiting_for_topic"] = False
@@ -518,13 +532,22 @@ def build_timer_keyboard(make_callback):
     return InlineKeyboardMarkup([row[:3], row[3:]])
 
 async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("waiting_for_file") or not is_admin(update):
+    if not is_admin(update):
         return
 
     doc = update.message.document
     if not doc or not doc.file_name or not doc.file_name.lower().endswith(".json"):
-        await update.message.reply_text("❌ Kripya sirf <code>.json</code> file hi bhejein.", parse_mode="HTML")
+        if context.user_data.get("waiting_for_file"):
+            await update.message.reply_text("❌ Kripya sirf <code>.json</code> file hi bhejein.", parse_mode="HTML")
         return
+
+    # Allow direct JSON upload even without /newquiz if no quiz is currently running
+    if not context.user_data.get("waiting_for_file"):
+        if quiz_state and quiz_state.get("status") == "running":
+            await update.message.reply_text("⚠️ Pehle chal rahe quiz ko /pause karein, phir nayi JSON bhejein.")
+            return
+        if quiz_state and quiz_state.get("quiz_data"):
+            save_quiz_to_library(quiz_state)
 
     tg_file = await doc.get_file()
     file_bytes = await tg_file.download_as_bytearray()
@@ -620,6 +643,8 @@ async def launch_quiz(bot, quiz_data, quiz_name, timer_val, source=None, chat_id
 
     archived_id = None
     if quiz_state and quiz_state.get("quiz_data"):
+        if quiz_state.get("status") == "running":
+            quiz_state["status"] = "paused"
         archived_id = save_quiz_to_library(quiz_state)
         if quiz_task is not None and not quiz_task.done():
             quiz_task.cancel()
@@ -647,7 +672,6 @@ async def launch_quiz(bot, quiz_data, quiz_name, timer_val, source=None, chat_id
         quiz_state["source_name"] = source["name"]
 
     save_state()
-    save_quiz_to_library(quiz_state)
     active_polls.clear()
     pause_event.set()
     quiz_task = asyncio.create_task(run_quiz(bot))
@@ -677,11 +701,12 @@ async def timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ {exc}")
         return
 
+    saved_note = f"\n🗂️ Purana quiz MongoDB me save ho gaya (/savedquizzes se kabhi bhi resume karein)." if archived_id else ""
     await query.edit_message_text(
         f"🚀 <b>Quiz Ready! Shuru ho raha hai...</b>\n\n"
         f"📌 <b>Topic:</b> {esc(quiz_name)}\n"
         f"📊 <b>Questions:</b> {len(quiz_data)}\n"
-        f"⏱️ <b>Timer:</b> {timer_val}s per question",
+        f"⏱️ <b>Timer:</b> {timer_val}s per question{saved_note}",
         parse_mode="HTML",
     )
 
@@ -881,6 +906,44 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pause_event.clear()
     await update.message.reply_text("⏸️ Quiz pause ho gaya hai. /resume se jaari karein.")
 
+async def switch_and_resume_quiz(bot, requested_id):
+    """Helper to switch active quiz to a saved quiz from MongoDB and resume it."""
+    global quiz_state, quiz_task
+    q_id, loaded_obj = get_quiz_by_id(requested_id)
+    if not loaded_obj:
+        return False, "⚠️ Saved quiz nahi mila. /savedquizzes dekhein."
+
+    if quiz_state and quiz_state.get("status") == "running" and str(quiz_state.get("quiz_id")) != str(q_id):
+        return False, "⚠️ Pehle abhi chal rahe quiz ko /pause karein, phir dusra quiz resume karein."
+
+    if quiz_state and quiz_state.get("quiz_data") and str(quiz_state.get("quiz_id")) != str(q_id):
+        save_quiz_to_library(quiz_state)
+
+    quiz_state = loaded_obj
+    quiz_state["quiz_id"] = q_id
+    quiz_state["status"] = "running"
+
+    if quiz_state.get("current_index", 0) >= len(quiz_state.get("quiz_data", [])):
+        quiz_state["current_index"] = 0
+        quiz_state["scores"] = {}
+        quiz_state["names"] = {}
+
+    save_state()
+    active_polls.clear()
+    pause_event.set()
+
+    if quiz_task is not None and not quiz_task.done():
+        quiz_task.cancel()
+        try:
+            await quiz_task
+        except asyncio.CancelledError:
+            pass
+
+    quiz_task = asyncio.create_task(run_quiz(bot))
+    next_q = quiz_state["current_index"] + 1
+    total_q = len(quiz_state.get("quiz_data", []))
+    return True, f"▶️ <b>{esc(quiz_state.get('quiz_name', 'Quiz'))}</b> resume ho gaya! Question {next_q}/{total_q} se chal raha hai."
+
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state, quiz_task
     if not is_admin(update):
@@ -901,52 +964,49 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not requested_id:
-        await update.message.reply_text("⚠️ Kis quiz ko resume karna hai? /savedquizzes se ID dekhein aur <code>/resume ID</code> bhejein.", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Kis quiz ko resume karna hai? /savedquizzes bhejein aur button par click karein.", parse_mode="HTML")
         return
 
-    q_id, loaded_obj = get_quiz_by_id(requested_id)
-    if not loaded_obj:
-        await update.message.reply_text("⚠️ Saved quiz nahi mila. /savedquizzes dekhein.")
+    ok, msg = await switch_and_resume_quiz(context.bot, requested_id)
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+async def resume_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update):
         return
 
-    if quiz_state and quiz_state.get("status") == "running":
-        await update.message.reply_text("⚠️ Pehle current quiz ko /pause karein.")
-        return
-    if quiz_state and quiz_state.get("status") == "paused":
-        save_quiz_to_library(quiz_state)
-
-    quiz_state = loaded_obj
-    quiz_state["quiz_id"] = q_id
-    quiz_state["status"] = "running"
-    if quiz_state.get("current_index", 0) >= len(quiz_state.get("quiz_data", [])):
-        quiz_state["current_index"] = 0
-        quiz_state["scores"] = {}
-        quiz_state["names"] = {}
-    save_state()
-    active_polls.clear()
-    pause_event.set()
-    if quiz_task is not None and not quiz_task.done():
-        quiz_task.cancel()
-        try:
-            await quiz_task
-        except asyncio.CancelledError:
-            pass
-    quiz_task = asyncio.create_task(run_quiz(context.bot))
-    await update.message.reply_text(f"▶️ Saved Quiz <code>{esc(q_id)}</code> resume ho gaya!", parse_mode="HTML")
+    q_id = query.data.split(":", 1)[1]
+    ok, msg = await switch_and_resume_quiz(context.bot, q_id)
+    await query.message.reply_text(msg, parse_mode="HTML")
 
 async def savedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("❌ Sirf admin saved quizzes dekh sakta hai.")
         return
+
     rows = list_saved_quizzes()
     if not rows:
         await update.message.reply_text("Koi saved quiz nahi hai.")
         return
-    lines = ["🗂️ <b>Saved Quizzes Library (MongoDB):</b>"]
-    for q_id, name, done, total in rows:
-        lines.append(f"• <code>{esc(q_id)}</code> | <b>{esc(name)}</b> | {total or 0} Qs")
-    lines.append("\nMain group me chalane ke liye: <code>/resume ID</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    lines = ["🗂️ <b>Saved Quizzes Library (MongoDB):</b>\nNiche kisi bhi quiz ke <b>▶️ Resume</b> button par click karke wahin se chalu karein:\n"]
+    buttons = []
+
+    for idx, (q_id, name, done, total, status) in enumerate(rows[:12], start=1):
+        total = total or 0
+        progress_txt = "Completed (Restart hoga)" if done >= total and total > 0 else f"Q.{done + 1}/{total} se baki"
+        lines.append(f"{idx}. <b>{esc(name)}</b> — <i>{progress_txt}</i>")
+        buttons.append([
+            InlineKeyboardButton(f"▶️ Resume #{idx}: {name[:28]}", callback_data=f"resumesaved:{q_id}")
+        ])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML"
+    )
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not quiz_state:
@@ -975,7 +1035,6 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     quiz_state["status"] = "stopped"
     save_state()
-    save_quiz_to_library(quiz_state)
     pause_event.set()
     await update.message.reply_text("⏹️ Quiz band kar diya gaya hai aur MongoDB library me save kar diya gaya hai.")
 
@@ -990,6 +1049,7 @@ async def run_quiz(bot):
     quiz_data = quiz_state["quiz_data"]
     total_q = len(quiz_data)
     timer = quiz_state.get("timer", DEFAULT_TIMER)
+    cur_quiz_id = str(quiz_state.get("quiz_id", ""))
 
     if quiz_state.get("current_index", 0) == 0:
         try:
@@ -1041,16 +1101,21 @@ async def run_quiz(bot):
                 poll_kwargs["explanation"] = explanation
 
             poll_msg = await bot.send_poll(**poll_kwargs)
-            active_polls[poll_msg.poll.id] = ("group", chat_id, correct_index)
+            active_polls[poll_msg.poll.id] = ("group", chat_id, correct_index, cur_quiz_id)
             await asyncio.sleep(timer + 2)
         except Exception as exc:
             print(f"Poll send error: {exc}")
             await asyncio.sleep(3)
 
+        if not quiz_state or str(quiz_state.get("quiz_id", "")) != cur_quiz_id:
+            return
+        if quiz_state.get("status") != "running":
+            continue
+
         quiz_state["current_index"] = index + 1
         save_state()
 
-    if quiz_state and quiz_state.get("status") == "running":
+    if quiz_state and quiz_state.get("status") == "running" and str(quiz_state.get("quiz_id", "")) == cur_quiz_id:
         quiz_state["status"] = "completed"
         save_state()
         saved_id = save_quiz_to_library(quiz_state)
@@ -1080,10 +1145,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if answer.poll_id not in active_polls:
         return
 
-    mode, target_id, correct_option_id = active_polls[answer.poll_id]
+    mode, target_id, correct_option_id, poll_quiz_id = active_polls[answer.poll_id]
 
     if mode == "group":
-        if not quiz_state:
+        if not quiz_state or str(quiz_state.get("quiz_id", "")) != str(poll_quiz_id):
             return
         uid = str(user.id)
         quiz_state.setdefault("names", {})[uid] = full_name
@@ -1242,6 +1307,7 @@ def main():
     app.add_handler(CallbackQueryHandler(timer_selected, pattern=r"^timer:"))
     app.add_handler(CallbackQueryHandler(next_topic_selected, pattern=r"^nexttopic:"))
     app.add_handler(CallbackQueryHandler(next_timer_selected, pattern=r"^nexttimer:"))
+    app.add_handler(CallbackQueryHandler(resume_saved_callback, pattern=r"^resumesaved:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_json_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
@@ -1252,4 +1318,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
