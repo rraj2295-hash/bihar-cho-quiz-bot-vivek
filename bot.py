@@ -102,6 +102,7 @@ def init_db():
     except Exception as exc:
         print(f"❌ MongoDB Connection Error: {exc}")
 
+
 def save_state():
     if quiz_state is None:
         return
@@ -111,9 +112,9 @@ def save_state():
             doc["_id"] = "current_state"
             state_col.replace_one({"_id": "current_state"}, doc, upsert=True)
         except Exception as exc:
-            print(f"MongoDB save_state error: {exc}")
-    # Keep library synced with latest progress
+            print(f"❌ MongoDB save_state error: {exc}")
     save_quiz_to_library(quiz_state)
+
 
 def load_state():
     if state_col is None:
@@ -124,8 +125,9 @@ def load_state():
             doc.pop("_id", None)
             return doc
     except Exception as exc:
-        print(f"MongoDB load_state error: {exc}")
+        print(f"❌ MongoDB load_state error: {exc}")
     return None
+
 
 def save_quiz_to_library(state_dict=None):
     """Stores a quiz permanently in MongoDB saved_quizzes collection."""
@@ -137,6 +139,7 @@ def save_quiz_to_library(state_dict=None):
     name = target.get("quiz_name") or f"Quiz-{quiz_id}"
 
     if quizzes_col is None:
+        print("⚠️ quizzes_col is None! Check MONGO_URI.")
         return quiz_id
 
     try:
@@ -150,9 +153,11 @@ def save_quiz_to_library(state_dict=None):
             "payload": payload_copy,
         }
         quizzes_col.replace_one({"_id": quiz_id}, doc, upsert=True)
+        print(f"✅ Quiz '{name}' (ID: {quiz_id}) saved to MongoDB.")
     except Exception as exc:
-        print(f"MongoDB save_quiz_to_library error: {exc}")
+        print(f"❌ MongoDB save_quiz_to_library error: {exc}")
     return quiz_id
+
 
 def list_saved_quizzes():
     if quizzes_col is None:
@@ -174,8 +179,9 @@ def list_saved_quizzes():
             ))
         return results
     except Exception as exc:
-        print(f"MongoDB list_saved_quizzes error: {exc}")
+        print(f"❌ MongoDB list_saved_quizzes error: {exc}")
         return []
+
 
 def get_quiz_by_id(quiz_id=None):
     """Fetch a specific quiz from active state or MongoDB library."""
@@ -192,11 +198,12 @@ def get_quiz_by_id(quiz_id=None):
             if doc and doc.get("payload"):
                 return doc["quiz_id"], dict(doc["payload"])
         except Exception as exc:
-            print(f"MongoDB get_quiz_by_id error: {exc}")
+            print(f"❌ MongoDB get_quiz_by_id error: {exc}")
 
     if quiz_state and quiz_state.get("quiz_data"):
         return str(quiz_state.get("quiz_id", "current")), dict(quiz_state)
     return None, None
+
 
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID and ADMIN_ID != 0)
@@ -425,6 +432,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+
 async def selfquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_info = await context.bot.get_me()
     req_id = context.args[0] if context.args else None
@@ -453,6 +461,7 @@ async def selfquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     await update.message.reply_text(f"🎯 <b>{esc(q_obj.get('quiz_name', 'Self-Quiz'))}</b> shuru ho raha hai...", parse_mode="HTML")
     await send_self_quiz_question(context.bot, user_id)
+
 
 async def quizzes_library_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_saved_quizzes()
@@ -494,6 +503,7 @@ async def quizzes_library_command(update: Update, context: ContextTypes.DEFAULT_
         parse_mode="HTML"
     )
 
+
 async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state
     if not is_admin(update):
@@ -504,7 +514,6 @@ async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Pehle /pause karein, phir nayi JSON upload karein.")
         return
 
-    # Save current paused quiz safely before uploading a new one
     if quiz_state and quiz_state.get("quiz_data"):
         save_quiz_to_library(quiz_state)
 
@@ -513,6 +522,7 @@ async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_for_topic"] = False
     context.user_data["temp_source"] = None
     await update.message.reply_text("📂 Kripya valid <code>.json</code> quiz file upload karein.", parse_mode="HTML")
+
 
 def build_topic_keyboard(topics, prefix="topic"):
     rows, row = [], []
@@ -527,9 +537,11 @@ def build_topic_keyboard(topics, prefix="topic"):
         rows.append([InlineKeyboardButton("📚 Sab Topics (All)", callback_data="topic:all")])
     return InlineKeyboardMarkup(rows)
 
+
 def build_timer_keyboard(make_callback):
     row = [InlineKeyboardButton(f"⏱️ {s}s", callback_data=make_callback(s)) for s in TIMER_OPTIONS]
     return InlineKeyboardMarkup([row[:3], row[3:]])
+
 
 async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -541,7 +553,6 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Kripya sirf <code>.json</code> file hi bhejein.", parse_mode="HTML")
         return
 
-    # Allow direct JSON upload even without /newquiz if no quiz is currently running
     if not context.user_data.get("waiting_for_file"):
         if quiz_state and quiz_state.get("status") == "running":
             await update.message.reply_text("⚠️ Pehle chal rahe quiz ko /pause karein, phir nayi JSON bhejein.")
@@ -595,6 +606,7 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
+
 async def topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -630,6 +642,7 @@ async def topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏱️ Ab timer chunein (ya seconds me likh kar bhejein):",
         reply_markup=build_timer_keyboard(lambda s: f"timer:{s}"),
     )
+
 
 async def launch_quiz(bot, quiz_data, quiz_name, timer_val, source=None, chat_id=None):
     """Naya quiz shuru karta hai. Purana quiz MongoDB library me save hota hai."""
@@ -677,6 +690,7 @@ async def launch_quiz(bot, quiz_data, quiz_name, timer_val, source=None, chat_id
     quiz_task = asyncio.create_task(run_quiz(bot))
     return new_quiz_id, archived_id
 
+
 async def timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -701,7 +715,7 @@ async def timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ {exc}")
         return
 
-    saved_note = f"\n🗂️ Purana quiz MongoDB me save ho gaya (/savedquizzes se kabhi bhi resume karein)." if archived_id else ""
+    saved_note = "\n🗂️ Purana quiz MongoDB me save ho gaya (/savedquizzes se kabhi bhi resume karein)." if archived_id else ""
     await query.edit_message_text(
         f"🚀 <b>Quiz Ready! Shuru ho raha hai...</b>\n\n"
         f"📌 <b>Topic:</b> {esc(quiz_name)}\n"
@@ -709,6 +723,7 @@ async def timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏱️ <b>Timer:</b> {timer_val}s per question{saved_note}",
         parse_mode="HTML",
     )
+
 
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("waiting_for_timer") or not is_admin(update):
@@ -742,6 +757,7 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="HTML"
     )
 
+
 async def next_topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -773,6 +789,7 @@ async def next_topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=build_timer_keyboard(lambda s: f"nexttimer:{idx}:{s}"),
         parse_mode="HTML",
     )
+
 
 async def next_timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -813,6 +830,7 @@ async def next_timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     await launch_quiz(context.bot, selected, topic, timer_val, source=source, chat_id=chat_id)
 
+
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state, quiz_task
     if not is_admin(update):
@@ -845,6 +863,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
     quiz_task = asyncio.create_task(run_quiz(context.bot))
+
 
 async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req_id = context.args[0] if context.args else None
@@ -892,6 +911,7 @@ async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+
 async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state
     if not is_admin(update):
@@ -905,6 +925,7 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state()
     pause_event.clear()
     await update.message.reply_text("⏸️ Quiz pause ho gaya hai. /resume se jaari karein.")
+
 
 async def switch_and_resume_quiz(bot, requested_id):
     """Helper to switch active quiz to a saved quiz from MongoDB and resume it."""
@@ -944,6 +965,7 @@ async def switch_and_resume_quiz(bot, requested_id):
     total_q = len(quiz_state.get("quiz_data", []))
     return True, f"▶️ <b>{esc(quiz_state.get('quiz_name', 'Quiz'))}</b> resume ho gaya! Question {next_q}/{total_q} se chal raha hai."
 
+
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state, quiz_task
     if not is_admin(update):
@@ -970,6 +992,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, msg = await switch_and_resume_quiz(context.bot, requested_id)
     await update.message.reply_text(msg, parse_mode="HTML")
 
+
 async def resume_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -981,22 +1004,47 @@ async def resume_saved_callback(update: Update, context: ContextTypes.DEFAULT_TY
     ok, msg = await switch_and_resume_quiz(context.bot, q_id)
     await query.message.reply_text(msg, parse_mode="HTML")
 
+
 async def savedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("❌ Sirf admin saved quizzes dekh sakta hai.")
         return
 
     rows = list_saved_quizzes()
-    if not rows:
+    items = []
+    seen = set()
+
+    if quiz_state and quiz_state.get("quiz_data"):
+        cur_id = str(quiz_state.get("quiz_id", "current"))
+        seen.add(cur_id)
+        items.append((
+            cur_id,
+            quiz_state.get("quiz_name", "Current Quiz"),
+            quiz_state.get("current_index", 0),
+            quiz_state.get("total", len(quiz_state["quiz_data"])),
+            quiz_state.get("status", "running"),
+        ))
+
+    for q_id, name, done, total, status in rows:
+        if str(q_id) not in seen:
+            seen.add(str(q_id))
+            items.append((str(q_id), name, done, total, status))
+
+    if not items:
         await update.message.reply_text("Koi saved quiz nahi hai.")
         return
 
     lines = ["🗂️ <b>Saved Quizzes Library (MongoDB):</b>\nNiche kisi bhi quiz ke <b>▶️ Resume</b> button par click karke wahin se chalu karein:\n"]
     buttons = []
 
-    for idx, (q_id, name, done, total, status) in enumerate(rows[:12], start=1):
+    for idx, (q_id, name, done, total, status) in enumerate(items[:12], start=1):
         total = total or 0
-        progress_txt = "Completed (Restart hoga)" if done >= total and total > 0 else f"Q.{done + 1}/{total} se baki"
+        if status == "running":
+            progress_txt = f"🟢 Running (Q.{done + 1}/{total})"
+        elif done >= total and total > 0:
+            progress_txt = "Completed (Restart hoga)"
+        else:
+            progress_txt = f"Q.{done + 1}/{total} se baki"
         lines.append(f"{idx}. <b>{esc(name)}</b> — <i>{progress_txt}</i>")
         buttons.append([
             InlineKeyboardButton(f"▶️ Resume #{idx}: {name[:28]}", callback_data=f"resumesaved:{q_id}")
@@ -1007,6 +1055,7 @@ async def savedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="HTML"
     )
+
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not quiz_state:
@@ -1023,6 +1072,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 <b>Active Participants:</b> {len(quiz_state.get('names', {}))}",
         parse_mode="HTML"
     )
+
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global quiz_state
@@ -1268,6 +1318,7 @@ async def restore_quiz(application):
     else:
         pause_event.set()
 
+
 async def error_handler(update, context):
     print(f">> Telegram Error: {context.error}")
 
@@ -1315,6 +1366,7 @@ def main():
 
     print(">> Telegram Quiz Bot polling shuru ho chuki hai...")
     app.run_polling(drop_pending_updates=False)
+
 
 if __name__ == "__main__":
     main()
