@@ -26,6 +26,10 @@ web_app = Flask(__name__)
 def home():
     return "Telegram Quiz Bot with MongoDB is running successfully!"
 
+@web_app.route("/health")
+def health():
+    return {"status": "ok", "quiz_status": quiz_state.get("status") if quiz_state else "idle"}, 200
+
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     web_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
@@ -93,7 +97,12 @@ def init_db():
         print("⚠️ WARNING: MONGO_URI set nahi hai! Data permanent save nahi hoga.")
         return
     try:
-        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        mongo_client = MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+        )
         mongo_client.admin.command("ping")
         db = mongo_client["telegram_quiz_bot"]
         state_col = db["active_state"]
@@ -103,17 +112,29 @@ def init_db():
         print(f"❌ MongoDB Connection Error: {exc}")
 
 
-def save_state():
-    if quiz_state is None:
+def _sync_save_state(state_snapshot):
+    if state_snapshot is None:
         return
     if state_col is not None:
         try:
-            doc = dict(quiz_state)
+            doc = dict(state_snapshot)
             doc["_id"] = "current_state"
             state_col.replace_one({"_id": "current_state"}, doc, upsert=True)
         except Exception as exc:
             print(f"❌ MongoDB save_state error: {exc}")
-    save_quiz_to_library(quiz_state)
+    save_quiz_to_library(state_snapshot)
+
+
+def save_state():
+    """Schedules non-blocking MongoDB save so event loop never freezes."""
+    if quiz_state is None:
+        return
+    snapshot = dict(quiz_state)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(asyncio.to_thread(_sync_save_state, snapshot))
+    except RuntimeError:
+        _sync_save_state(snapshot)
 
 
 def load_state():
@@ -367,7 +388,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         parts = arg.split("_", 1)
         req_id = parts[1] if len(parts) > 1 and parts[1] else None
-        q_id, q_obj = get_quiz_by_id(req_id)
+        q_id, q_obj = await asyncio.to_thread(get_quiz_by_id, req_id)
 
         if not q_obj or not q_obj.get("quiz_data"):
             await update.message.reply_text("⚠️ Yeh quiz uplabdh nahi hai.")
@@ -392,7 +413,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if arg.startswith("selfquiz"):
         parts = arg.split("_", 1)
         req_id = parts[1] if len(parts) > 1 and parts[1] else None
-        q_id, q_obj = get_quiz_by_id(req_id)
+        q_id, q_obj = await asyncio.to_thread(get_quiz_by_id, req_id)
 
         if not q_obj or not q_obj.get("quiz_data"):
             await update.message.reply_text("⚠️ Abhi koi active ya saved quiz uplabdh nahi hai.")
@@ -436,7 +457,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def selfquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_info = await context.bot.get_me()
     req_id = context.args[0] if context.args else None
-    q_id, q_obj = get_quiz_by_id(req_id)
+    q_id, q_obj = await asyncio.to_thread(get_quiz_by_id, req_id)
 
     if update.effective_chat.type != "private":
         param = f"selfquiz_{q_id}" if q_id else "selfquiz"
@@ -464,7 +485,7 @@ async def selfquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def quizzes_library_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = list_saved_quizzes()
+    rows = await asyncio.to_thread(list_saved_quizzes)
     bot_info = await context.bot.get_me()
     bot_username = bot_info.username
 
@@ -515,7 +536,7 @@ async def ask_for_quiz_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if quiz_state and quiz_state.get("quiz_data"):
-        save_quiz_to_library(quiz_state)
+        await asyncio.to_thread(save_quiz_to_library, dict(quiz_state))
 
     context.user_data["waiting_for_file"] = True
     context.user_data["waiting_for_timer"] = False
@@ -558,7 +579,7 @@ async def handle_json_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Pehle chal rahe quiz ko /pause karein, phir nayi JSON bhejein.")
             return
         if quiz_state and quiz_state.get("quiz_data"):
-            save_quiz_to_library(quiz_state)
+            await asyncio.to_thread(save_quiz_to_library, dict(quiz_state))
 
     tg_file = await doc.get_file()
     file_bytes = await tg_file.download_as_bytearray()
@@ -658,7 +679,7 @@ async def launch_quiz(bot, quiz_data, quiz_name, timer_val, source=None, chat_id
     if quiz_state and quiz_state.get("quiz_data"):
         if quiz_state.get("status") == "running":
             quiz_state["status"] = "paused"
-        archived_id = save_quiz_to_library(quiz_state)
+        archived_id = await asyncio.to_thread(save_quiz_to_library, dict(quiz_state))
         if quiz_task is not None and not quiz_task.done():
             quiz_task.cancel()
             try:
@@ -707,10 +728,11 @@ async def timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quiz_data = context.user_data.get("temp_quiz_data")
     quiz_name = context.user_data.get("temp_quiz_name")
     source = context.user_data.get("temp_source")
+    chat_id = context.user_data.pop("temp_chat_id", None)
     context.user_data["temp_source"] = None
 
     try:
-        _, archived_id = await launch_quiz(context.bot, quiz_data, quiz_name, timer_val, source=source)
+        _, archived_id = await launch_quiz(context.bot, quiz_data, quiz_name, timer_val, source=source, chat_id=chat_id)
     except ValueError as exc:
         await query.edit_message_text(f"❌ {exc}")
         return
@@ -740,10 +762,11 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     quiz_data = context.user_data.get("temp_quiz_data")
     quiz_name = context.user_data.get("temp_quiz_name")
     source = context.user_data.get("temp_source")
+    chat_id = context.user_data.pop("temp_chat_id", None)
     context.user_data["temp_source"] = None
 
     try:
-        _, archived_id = await launch_quiz(context.bot, quiz_data, quiz_name, timer_val, source=source)
+        _, archived_id = await launch_quiz(context.bot, quiz_data, quiz_name, timer_val, source=source, chat_id=chat_id)
     except ValueError as exc:
         await update.message.reply_text(f"❌ {exc}")
         return
@@ -782,10 +805,22 @@ async def next_topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("⚠️ Is topic me koi question nahi mila.")
         return
 
+    # Save in user_data too so typing timer (e.g. "15") works alongside inline buttons
+    context.user_data["temp_quiz_data"] = selected
+    context.user_data["temp_quiz_name"] = topic
+    context.user_data["temp_source"] = {
+        "data": src,
+        "topics": topics,
+        "name": quiz_state.get("source_name", ""),
+    }
+    context.user_data["temp_chat_id"] = quiz_state["chat_id"]
+    context.user_data["waiting_for_topic"] = False
+    context.user_data["waiting_for_timer"] = True
+
     await query.edit_message_text(
         f"📖 Topic: <b>{esc(topic)}</b>\n"
         f"📊 Total {len(selected)} questions.\n\n"
-        f"⏱️ Ab timer chunein:",
+        f"⏱️ Ab timer chunein (ya seconds me likh kar bhejein):",
         reply_markup=build_timer_keyboard(lambda s: f"nexttimer:{idx}:{s}"),
         parse_mode="HTML",
     )
@@ -815,6 +850,10 @@ async def next_timer_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not selected:
         await query.edit_message_text("⚠️ Is topic me koi question nahi mila.")
         return
+
+    context.user_data["waiting_for_timer"] = False
+    context.user_data["temp_source"] = None
+    context.user_data.pop("temp_chat_id", None)
 
     source = {
         "data": src,
@@ -867,7 +906,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req_id = context.args[0] if context.args else None
-    q_id, q_obj = get_quiz_by_id(req_id)
+    q_id, q_obj = await asyncio.to_thread(get_quiz_by_id, req_id)
 
     if not q_obj or not q_obj.get("quiz_data"):
         await update.message.reply_text("Abhi koi active ya saved quiz nahi hai.")
@@ -930,7 +969,7 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def switch_and_resume_quiz(bot, requested_id):
     """Helper to switch active quiz to a saved quiz from MongoDB and resume it."""
     global quiz_state, quiz_task
-    q_id, loaded_obj = get_quiz_by_id(requested_id)
+    q_id, loaded_obj = await asyncio.to_thread(get_quiz_by_id, requested_id)
     if not loaded_obj:
         return False, "⚠️ Saved quiz nahi mila. /savedquizzes dekhein."
 
@@ -938,7 +977,7 @@ async def switch_and_resume_quiz(bot, requested_id):
         return False, "⚠️ Pehle abhi chal rahe quiz ko /pause karein, phir dusra quiz resume karein."
 
     if quiz_state and quiz_state.get("quiz_data") and str(quiz_state.get("quiz_id")) != str(q_id):
-        save_quiz_to_library(quiz_state)
+        await asyncio.to_thread(save_quiz_to_library, dict(quiz_state))
 
     quiz_state = loaded_obj
     quiz_state["quiz_id"] = q_id
@@ -1010,7 +1049,7 @@ async def savedquizzes_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Sirf admin saved quizzes dekh sakta hai.")
         return
 
-    rows = list_saved_quizzes()
+    rows = await asyncio.to_thread(list_saved_quizzes)
     items = []
     seen = set()
 
@@ -1168,7 +1207,7 @@ async def run_quiz(bot):
     if quiz_state and quiz_state.get("status") == "running" and str(quiz_state.get("quiz_id", "")) == cur_quiz_id:
         quiz_state["status"] = "completed"
         save_state()
-        saved_id = save_quiz_to_library(quiz_state)
+        saved_id = await asyncio.to_thread(save_quiz_to_library, dict(quiz_state))
         await send_leaderboard(bot, chat_id, total_q, custom_quiz_id=saved_id)
 
         if quiz_state.get("source_topics") and ADMIN_ID:
@@ -1306,7 +1345,7 @@ async def send_leaderboard(
 # ---------------- Startup / Errors ----------------
 async def restore_quiz(application):
     global quiz_state, quiz_task
-    quiz_state = load_state()
+    quiz_state = await asyncio.to_thread(load_state)
 
     if quiz_state and quiz_state.get("status") == "running":
         pause_event.set()
@@ -1365,7 +1404,7 @@ def main():
     app.add_error_handler(error_handler)
 
     print(">> Telegram Quiz Bot polling shuru ho chuki hai...")
-    app.run_polling(drop_pending_updates=False)
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
