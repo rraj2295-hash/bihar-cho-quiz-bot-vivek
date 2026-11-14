@@ -3,12 +3,14 @@ import html
 import json
 import time
 import urllib.parse
+import urllib.request
 import asyncio
 import threading
 from pathlib import Path
 from flask import Flask
 from pymongo import MongoClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -57,6 +59,7 @@ quiz_state = None
 user_sessions = {}       # user_id -> self quiz session
 group_sessions = {}      # chat_id -> shared group quiz session
 group_tasks = {}         # chat_id -> asyncio.Task
+_last_db_save_time = 0.0
 
 
 def esc(val) -> str:
@@ -125,10 +128,15 @@ def _sync_save_state(state_snapshot):
     save_quiz_to_library(state_snapshot)
 
 
-def save_state():
-    """Schedules non-blocking MongoDB save so event loop never freezes."""
+def save_state(force=False):
+    """Har click par DB flood rokne ke liye kam se kam 5s ke gap par non-blocking save karta hai."""
+    global _last_db_save_time
     if quiz_state is None:
         return
+    now = time.time()
+    if not force and (now - _last_db_save_time) < 5.0:
+        return
+    _last_db_save_time = now
     snapshot = dict(quiz_state)
     try:
         loop = asyncio.get_running_loop()
@@ -228,6 +236,17 @@ def get_quiz_by_id(quiz_id=None):
 
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID and ADMIN_ID != 0)
+
+
+async def keep_render_awake():
+    """Har 9 minute me Render web service ko ping karke sleep/throttle se bachata hai."""
+    url = os.environ.get("RENDER_EXTERNAL_URL", "https://bihar-cho-quiz-bot-1.onrender.com") + "/health"
+    while True:
+        await asyncio.sleep(540)
+        try:
+            await asyncio.to_thread(urllib.request.urlopen, url, None, 10)
+        except Exception:
+            pass
 
 
 # ---------------- Individual Self-Quiz Helper ----------------
@@ -335,13 +354,16 @@ async def run_shared_group_quiz(bot, target_chat_id):
         session["active"] = False
         return
 
-    for index, item in enumerate(quiz_data):
+    index = 0
+    while index < total_q:
         if not session.get("active"):
             return
 
+        item = quiz_data[index]
         q_text, options, correct_index, explanation = parse_question_item(item, index, total_q)
 
         if len(options) < 2:
+            index += 1
             continue
 
         try:
@@ -360,9 +382,13 @@ async def run_shared_group_quiz(bot, target_chat_id):
             poll_msg = await bot.send_poll(**poll_kwargs)
             active_polls[poll_msg.poll.id] = ("shared_group", target_chat_id, correct_index, quiz_id)
             await asyncio.sleep(timer + 2)
+            index += 1
+        except RetryAfter as e:
+            await asyncio.sleep(int(e.retry_after) + 2)
         except Exception as exc:
             print(f"Shared group poll error: {exc}")
             await asyncio.sleep(3)
+            index += 1
 
     session["active"] = False
     await send_leaderboard(
@@ -705,7 +731,7 @@ async def launch_quiz(bot, quiz_data, quiz_name, timer_val, source=None, chat_id
         quiz_state["source_topics"] = source["topics"]
         quiz_state["source_name"] = source["name"]
 
-    save_state()
+    save_state(force=True)
     active_polls.clear()
     pause_event.set()
     quiz_task = asyncio.create_task(run_quiz(bot))
@@ -805,7 +831,6 @@ async def next_topic_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("⚠️ Is topic me koi question nahi mila.")
         return
 
-    # Save in user_data too so typing timer (e.g. "15") works alongside inline buttons
     context.user_data["temp_quiz_data"] = selected
     context.user_data["temp_quiz_name"] = topic
     context.user_data["temp_source"] = {
@@ -891,7 +916,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quiz_state["scores"] = {}
     quiz_state["names"] = {}
     quiz_state["status"] = "running"
-    save_state()
+    save_state(force=True)
     active_polls.clear()
     pause_event.set()
 
@@ -961,7 +986,7 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     quiz_state["status"] = "paused"
-    save_state()
+    save_state(force=True)
     pause_event.clear()
     await update.message.reply_text("⏸️ Quiz pause ho gaya hai. /resume se jaari karein.")
 
@@ -988,7 +1013,7 @@ async def switch_and_resume_quiz(bot, requested_id):
         quiz_state["scores"] = {}
         quiz_state["names"] = {}
 
-    save_state()
+    save_state(force=True)
     active_polls.clear()
     pause_event.set()
 
@@ -1015,7 +1040,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if quiz_state and quiz_state.get("status") == "paused" and not requested_id:
         quiz_state["status"] = "running"
-        save_state()
+        save_state(force=True)
         pause_event.set()
         if quiz_task is None or quiz_task.done():
             quiz_task = asyncio.create_task(run_quiz(context.bot))
@@ -1123,7 +1148,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     quiz_state["status"] = "stopped"
-    save_state()
+    save_state(force=True)
     pause_event.set()
     await update.message.reply_text("⏹️ Quiz band kar diya gaya hai aur MongoDB library me save kar diya gaya hai.")
 
@@ -1173,7 +1198,7 @@ async def run_quiz(bot):
 
         if len(options) < 2:
             quiz_state["current_index"] = index + 1
-            save_state()
+            save_state(force=True)
             continue
 
         try:
@@ -1191,7 +1216,24 @@ async def run_quiz(bot):
 
             poll_msg = await bot.send_poll(**poll_kwargs)
             active_polls[poll_msg.poll.id] = ("group", chat_id, correct_index, cur_quiz_id)
+
+            if len(active_polls) > 100:
+                oldest_key = next(iter(active_polls))
+                active_polls.pop(oldest_key, None)
+
             await asyncio.sleep(timer + 2)
+
+        except RetryAfter as e:
+            wait_sec = int(e.retry_after) + 2
+            print(f"⚠️ Telegram Flood Limit: {wait_sec}s wait kar rahe hain...")
+            await asyncio.sleep(wait_sec)
+            continue
+
+        except (TimedOut, NetworkError) as e:
+            print(f"⚠️ Network timeout ({e}), 4s me retry...")
+            await asyncio.sleep(4)
+            continue
+
         except Exception as exc:
             print(f"Poll send error: {exc}")
             await asyncio.sleep(3)
@@ -1202,11 +1244,11 @@ async def run_quiz(bot):
             continue
 
         quiz_state["current_index"] = index + 1
-        save_state()
+        save_state(force=True)
 
     if quiz_state and quiz_state.get("status") == "running" and str(quiz_state.get("quiz_id", "")) == cur_quiz_id:
         quiz_state["status"] = "completed"
-        save_state()
+        save_state(force=True)
         saved_id = await asyncio.to_thread(save_quiz_to_library, dict(quiz_state))
         await send_leaderboard(bot, chat_id, total_q, custom_quiz_id=saved_id)
 
@@ -1244,7 +1286,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         quiz_state.setdefault("scores", {}).setdefault(uid, 0)
         if answer.option_ids and answer.option_ids[0] == correct_option_id:
             quiz_state["scores"][uid] += 1
-        save_state()
+        save_state(force=False)
 
     elif mode == "shared_group":
         session = group_sessions.get(target_id)
@@ -1345,6 +1387,7 @@ async def send_leaderboard(
 # ---------------- Startup / Errors ----------------
 async def restore_quiz(application):
     global quiz_state, quiz_task
+    asyncio.create_task(keep_render_awake())
     quiz_state = await asyncio.to_thread(load_state)
 
     if quiz_state and quiz_state.get("status") == "running":
@@ -1409,3 +1452,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
